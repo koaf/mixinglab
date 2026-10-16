@@ -1,0 +1,99 @@
+name: Windows release
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing source tag, e.g. v0.3.1"
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: windows-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      MIXING_LAB_UPDATER_PUBLIC_KEY: ${{ vars.MIXING_LAB_UPDATER_PUBLIC_KEY }}
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_BACKEND: software
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Validate configuration
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Use a stable vX.Y.Z release tag.' }
+          if (-not $env:MIXING_LAB_UPDATER_PUBLIC_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Configure updater signing variables and secrets.' }
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          if ("v$version" -ne $env:RELEASE_TAG) { throw 'Tag and app versions differ.' }
+      - name: Install dependencies
+        run: |
+          rustup default stable-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -e ".[dev]" ziglang==0.13.0.post1
+      - name: Build native libraries
+        run: |
+          python tools/build_native.py --windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/build_rust.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --manifest-path rust_audio/Cargo.toml
+      - name: Build desktop and installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          python tools/build_tauri.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/package_windows_portable.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/build_installer.py
+      - name: Stage release assets
+        shell: pwsh
+        run: python tools/prepare_github_release.py --version ($env:RELEASE_TAG.Substring(1))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-windows-release
+          path: build/github-release/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_REPOSITORY: ${{ vars.RELEASE_REPOSITORY || github.repository }}
+      GH_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-windows-release
+          path: release-assets
+      - name: Publish complete release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$RELEASE_REPOSITORY" --jq .private)" = "false" || { echo 'Release repository must be public.'; exit 1; }
+          # Create as draft so latest.json cannot become visible before the EXE.
+          # An existing tag intentionally fails; published versions are immutable here.
+          gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft --title "MIXING LAB $RELEASE_TAG" --notes "Windows x64 release. See latest.json for release notes."
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$RELEASE_REPOSITORY"
+          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest
